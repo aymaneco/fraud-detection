@@ -265,6 +265,23 @@ n'existe qu'une seule implémentation des 7 facettes.
 
 ## 5. Monitoring de la donnée en entrée
 
+### Ce qui est surveillé
+
+| Indicateur | Ce qu'il détecte | Périmètre | Calculé | Seuil |
+|---|---|---|---|---|
+| **Taux de conformité** | une intégration amont qui casse | 100 % des paniers reçus | à l'inférence | 98 % |
+| **Raisons de rejet** | quelle règle est violée (`prix_negatif`, `panier_vide`…) | 100 % des rejets | à l'inférence | diagnostic |
+| **Produits inconnus**, 5 granularités | le catalogue produit a changé | 100 % des paniers reçus | à l'inférence | 0,5 % à 15 % |
+| **PSI**, 9 variables | la *forme* d'une distribution a bougé | échantillon 20 % | en différé | 0,10 et 0,25 |
+| **Écart de moyenne**, 36 variables | le *niveau* d'une variable a bougé | échantillon 20 % | en différé | 50 % relatif, plancher 1 point |
+
+Les 45 variables du modèle sont donc toutes suivies, 9 par PSI et 36 par écart de
+moyenne. Le choix entre les deux est automatique et expliqué plus bas.
+
+Trois choses ne sont **pas** surveillées, volontairement : la distribution des scores du
+modèle, la performance (elle exige des étiquettes, qui arrivent avec des mois de retard),
+et l'infrastructure (latence, disponibilité), qui relève d'un autre outillage.
+
 ### Pourquoi deux niveaux
 
 Une demande de financement se décide **sur le champ**. Le monitoring ne doit donc jamais
@@ -409,6 +426,12 @@ Le choix entre les deux est **automatique** : une variable continue dont les dé
 sont effondrés, c'est-à-dire qui produit moins de tranches que demandé, est trop
 concentrée pour un PSI.
 
+En pratique cela déplace beaucoup de monde. Sur les 30 variables déclarées continues dans
+le profil, **7 seulement** gardent le PSI ; les 23 autres sont des ratios très tassés
+(`part_dom` proche de 1, `ratio_garantie` proche de 0) dont plusieurs bornes de déciles se
+confondent, et basculent sur l'écart de moyenne. Avec les 2 catégorielles et les
+13 discrètes, on obtient bien **9 PSI et 36 écarts de moyenne**.
+
 Chaque alerte indique **ce qui** a bougé, pas seulement un score :
 
 ```
@@ -547,55 +570,16 @@ prouverait rien.
 
 ## 7. Limites assumées
 
-Ce dépôt est une **version de démonstration**. Le monitoring qu'il contient sert à
-montrer à quoi ressemble concrètement la surveillance d'une donnée d'entrée : quels
-indicateurs, calculés à quel moment, sur quel périmètre, et pourquoi. Il tourne
-réellement, sur une base de contrôle réelle, mais il n'a pas la robustesse d'un système
-exploité. Les quatre points ci-dessous sont les écarts connus, avec ce qu'il faudrait
-faire pour les combler.
+Ce dépôt est une **version de démonstration du monitoring de la donnée d'entrée**. Il
+tourne réellement, sur une base de contrôle réelle, mais il montre le principe plutôt
+qu'il ne constitue un système exploité. Ce qui reste à faire :
 
-### Le nettoyage sémantique n'est pas dans le service
-
-Le portail (`PROD/pipeline/contract.py`, fonction `validate_wide`) valide la *structure* :
-types, prix positif, au moins un vrai bien. Il n'applique **pas** les normalisations de
-nomenclature de `DATA_QUALITY`, à savoir `norm_item` (173 libellés vers 139) et
-`norm_make` (829 vers 808). Ces deux fonctions n'existent aujourd'hui **que dans
-`DEV/DATA_QUALITY.ipynb`**, dans aucun module de `PROD/`.
-
-Conséquence concrète : un CSV brut passerait le portail sans erreur, mais les lookups
-produit échoueraient en masse, les tables ayant été construites sur les libellés
-normalisés. Le format attendu en entrée est donc celui de `data/X_*_clean.csv`.
-
-**Il faut l'intégrer.** `norm_item` et `norm_make` doivent sortir du notebook pour
-rejoindre un module `PROD/pipeline/normalisation.py`, appelé au tout début de `serve`,
-avant le portail. Le notebook l'importerait au lieu de définir les fonctions. C'est
-exactement le traitement qui a déjà été appliqué au calcul des variables, extrait dans
-`features_static.py` et partagé entre dev et prod : deux traitements de la donnée, un
-seul a franchi la frontière pour l'instant.
-
-### La distribution des scores n'est pas surveillée
-
-Choix délibéré, pas un oubli. Une référence de score calculée sur les données
-d'entraînement serait biaisée (0,0528 en échantillon contre 0,0410 hors échantillon) et
-déclencherait de fausses alertes en permanence. Surveiller la sortie du modèle demande
-une référence hors échantillon, donc un second jeu figé à l'entraînement. Le sujet du
-test étant la donnée d'entrée, cette partie n'a pas été traitée.
-
-### Le job différé n'est pas planifié
-
-`monitoring.rapport_drift` est appelé par le dashboard **au moment de l'affichage**. Pour
-une démonstration c'est suffisant et même pratique, puisque changer la fenêtre recalcule
-tout. En production on l'exécuterait la nuit par un ordonnanceur (Airflow, Control-M,
-cron), on archiverait le résultat dans une partition `drift/`, on émettrait les alertes
-depuis ce job, et le dashboard se contenterait de lire. La rétention de 90 jours
-(`store.purge()`) serait déclenchée par le même ordonnanceur.
-
-### Pas d'endpoint HTTP
-
-Sa logique existe entièrement dans `inference.serve`, qui enchaîne déjà portail, score,
-échantillonnage et journalisation. Un `@app.post("/score")` FastAPI ne serait que du
-transport, plus la gestion des codes de retour (422 sur panier invalide). Ce qui manque
-est la couche réseau, pas la logique métier.
+| Limite | Ce qu'il faudrait |
+|---|---|
+| **Le nettoyage sémantique n'est pas intégré.** `norm_item` et `norm_make` n'existent que dans `DEV/DATA_QUALITY.ipynb`. Le service attend donc de la donnée déjà nettoyée, au format `data/X_*_clean.csv`. | les extraire dans un module `PROD/pipeline/`, appelé avant le portail, comme cela a été fait pour `features_static.py` |
+| **Le job différé n'est pas planifié.** `rapport_drift` est calculé par le dashboard à l'affichage. | un ordonnanceur (Airflow, cron) qui l'exécute la nuit, archive le résultat et émet les alertes |
+| **Pas d'endpoint HTTP.** La logique complète est dans `inference.serve`. | une couche FastAPI par-dessus, du transport uniquement |
+| **La sortie du modèle n'est pas surveillée.** Hors sujet ici, et une référence de score calculée sur le train serait biaisée (0,0528 contre 0,0410 hors échantillon). | un jeu de référence hors échantillon, figé à l'entraînement |
 
 ---
 
