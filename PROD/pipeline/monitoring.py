@@ -1,40 +1,47 @@
-"""Monitoring de la donnée en entrée.
+"""Monitoring : calcul des métriques sur la donnée en entrée.
 
-Niveau immédiat (1 panier, temps réel) :
-  - check_schema(df)     : le panier est-il bien formé ? -> conforme + raisons
-  - conformity_report(df): agrège le taux de conformité + les raisons de rejet (KPI)
-  - route(...)           : quels paniers on garde dans la base de contrôle (flux A / flux B)
+Ce module ne décide rien et n'écrit rien. Il ne fait que **calculer des métriques**,
+à deux moments distincts :
 
-Le portail : un panier non conforme est LOGGÉ (avec sa raison) et NE PASSE PAS au modèle.
+  - **au fil de l'eau**, sur un lot reçu, parce que ces métriques portent sur 100 %
+    du trafic et ne seraient plus calculables ensuite (la base de contrôle ne garde
+    que 20 % des paniers, et uniquement les conformes) :
+        conformity_report(df)  taux de conformité + décompte des raisons de rejet
+        coverage(df, tables)   fraîcheur du catalogue produit
 
-Deux flux indépendants, jamais mélangés :
-  - flux A : échantillon UNIFORME (hash sur ID, taux configurable) -> seul flux lu par le PSI
-  - flux B : flux enrichi (non conformes, scores élevés) -> diagnostic / futures étiquettes
-Un panier peut appartenir aux deux : ce sont deux drapeaux, pas une catégorie.
+  - **en différé**, en relisant la base de contrôle :
+        fenetre(flux, jours)              lecture d'une fenêtre glissante
+        rapport_drift(profile, seuils)    PSI et écarts de moyenne (délègue à drift)
+
+L'échantillonnage, lui, n'est pas ici : c'est une décision prise au moment de
+l'inférence (`inference.route`), pas une métrique.
 """
-import os, json, hashlib
+import os, json
 import numpy as np, pandas as pd
+
 from contract import validate_wide
+import drift
+import store
 
 
-def check_schema(df):
-    """Portail : valide chaque panier au format large.
-    Renvoie [conforme (bool), raisons (str '|'-séparé)].
+_CFG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         "monitoring_config.json")
 
-    Délègue au contrat Pydantic (`contract.validate_wide`) : une seule définition
-    de la validité, partagée avec l'API. Les étiquettes de `raisons` sont stables
-    (prix_negatif, panier_vide, colonnes_manquantes…) car les KPI s'appuient dessus.
-    """
-    return validate_wide(df)
+def load_config(path=None):
+    "charge monitoring_config.json (taux d'échantillonnage, seuils…)."
+    with open(path or _CFG_PATH, encoding="utf-8") as f:
+        return json.load(f)
 
+
+# ── Métriques calculées sur un lot reçu ─────────────────────────────────────
 
 def conformity_report(df, res=None):
     """KPI de conformité sur un lot : taux + décompte des raisons de rejet.
 
-    `res` : résultat de `check_schema(df)` s'il a déjà été calculé. La validation
-    est le poste le plus coûteux du portail, on évite de la refaire pour rien.
+    `res` : résultat de `contract.validate_wide(df)` s'il a déjà été calculé. La
+    validation est le poste le plus coûteux du portail, on évite de la refaire.
     """
-    res = check_schema(df) if res is None else res
+    res = validate_wide(df) if res is None else res
     n = len(res); nc = int(res["conforme"].sum())
     from collections import Counter
     raisons = Counter()
@@ -46,60 +53,6 @@ def conformity_report(df, res=None):
             "taux_conformite": round(nc / n, 5) if n else 1.0,
             "raisons": dict(raisons)}
 
-
-# ── Échantillonnage : quels paniers entrent dans la base de contrôle ────────
-
-_CFG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                         "monitoring_config.json")
-
-def load_config(path=None):
-    "charge monitoring_config.json (taux d'échantillonnage, seuils…)."
-    with open(path or _CFG_PATH, encoding="utf-8") as f:
-        return json.load(f)
-
-
-def bucket(value):
-    """ID -> entier 0..99, STABLE (md5 : identique entre processus et serveurs).
-    On n'utilise pas hash() natif : il est randomisé par processus (PYTHONHASHSEED)."""
-    return int(hashlib.md5(str(value).encode()).hexdigest(), 16) % 100
-
-
-def in_sample_a(ids, rate_pct):
-    "masque booléen : le panier fait-il partie de l'échantillon uniforme (flux A) ?"
-    return np.array([bucket(v) < rate_pct for v in ids])
-
-
-def route(ids, conforme, proba=None, cfg=None):
-    """Décide, pour chaque panier, s'il entre dans la base de contrôle.
-
-    Renvoie [ID, flux_a, flux_b, raison_b] :
-      - flux_a : tiré dans l'échantillon uniforme ET conforme (le PSI exige des features valides)
-      - flux_b : non conforme, ou score >= seuil
-    Les deux peuvent être vrais simultanément (drapeaux indépendants).
-    """
-    cfg = cfg or load_config()
-    rate = cfg["flux_a"]["sample_rate_pct"]
-    b_cfg = cfg["flux_b"]
-    ids = np.asarray(ids); conforme = np.asarray(conforme, bool)
-
-    flux_a = in_sample_a(ids, rate) & conforme
-
-    flux_b = np.zeros(len(ids), bool)
-    raison_b = np.array([""] * len(ids), dtype=object)
-    if b_cfg.get("non_conformes", True):
-        m = ~conforme
-        flux_b |= m; raison_b[m] = "non_conforme"
-    seuil = b_cfg.get("score_threshold")
-    if seuil is not None and proba is not None:
-        p = pd.to_numeric(pd.Series(proba), errors="coerce").fillna(-1).to_numpy()
-        m = (p >= seuil) & conforme
-        flux_b |= m
-        raison_b[m] = np.where(raison_b[m] == "", "score_eleve", raison_b[m] + "|score_eleve")
-
-    return pd.DataFrame({"ID": ids, "flux_a": flux_a, "flux_b": flux_b, "raison_b": raison_b})
-
-
-# ── Couverture des tables produit (fraîcheur du catalogue) ──────────────────
 
 def coverage(raw_df, tables, B=None):
     """Le modèle connaît-il les produits de ce lot ?
@@ -149,3 +102,50 @@ def coverage(raw_df, tables, B=None):
     met["taux_dom_inconnu"]     = round(dom_inc / n, 5)     # produit PRINCIPAL inconnu -> alerte n°1
     met["part_valeur_inconnue"] = round(val_inc / val_tot, 5) if val_tot else 0.0
     return met, pd.DataFrame(lignes)
+
+
+# ── Métriques calculées en différé, sur la base de contrôle ─────────────────
+
+def fenetre(flux, jours=None, depuis=None):
+    """Lecture d'une fenêtre de la base de contrôle.
+    jours  : nb de jours en arrière depuis aujourd'hui (fenêtre glissante)
+    depuis : date 'YYYY-MM-DD' incluse (prioritaire sur `jours`)"""
+    return store.read_window(flux, jours=jours, depuis=depuis)
+
+
+def rapport_drift(profile, seuils, jours=7, live=None):
+    """Drift de la fenêtre contre le profil de référence figé.
+
+    Se lit uniquement sur `flux_a`, l'échantillon uniforme : c'est le seul sous-ensemble
+    représentatif de la population, et le seul qui porte les 45 variables calculées.
+    """
+    live = fenetre("flux_a", jours) if live is None else live
+    if live.empty:
+        return pd.DataFrame()
+    return drift.rapport(live, profile, seuils)
+
+
+def couverture_fenetre(seuils, jours=7, kpi=None):
+    """Les 5 granularités de couverture face à leurs seuils calibrés.
+
+    La lecture doit être CROISÉE : un taux de SKU inconnus qui explose seul peut
+    n'être qu'une renumérotation de références, sans dégradation du modèle. Mais SKU,
+    modèle et marque au-dessus du seuil en même temps, c'est l'assortiment qui a changé.
+    """
+    GRAINS = [("taux_cat_inconnus",   "taux_cat_inconnus_max",   "catégorie"),
+              ("taux_make_inconnus",  "taux_make_inconnus_max",  "marque"),
+              ("taux_dom_inconnu",    "taux_dom_inconnu_max",    "produit dominant"),
+              ("taux_model_inconnus", "taux_model_inconnus_max", "modèle"),
+              ("taux_sku_inconnus",   "taux_sku_inconnus_max",   "SKU")]
+    kpi = fenetre("kpi", jours) if kpi is None else kpi
+    if kpi.empty:
+        return pd.DataFrame(), 0
+    lignes, n_depasses = [], 0
+    for col, cle, libelle in GRAINS:
+        val, lim = float(kpi[col].mean()), seuils[cle]
+        etat = "dépassé" if val > lim else ("proche" if val > lim / 2 else "normal")
+        n_depasses += etat == "dépassé"
+        lignes.append({"granularité": libelle, "inconnus": val, "seuil": lim, "état": etat})
+    ordre = {"dépassé": 0, "proche": 1, "normal": 2}
+    tab = pd.DataFrame(lignes).sort_values("état", key=lambda s: s.map(ordre)).reset_index(drop=True)
+    return tab, n_depasses

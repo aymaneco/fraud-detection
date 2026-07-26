@@ -15,10 +15,10 @@ import os, sys, json
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "PROD", "pipeline"))
 
+# le dashboard ne lit la base de contrôle qu'à travers `monitoring` : il affiche,
+# il ne calcule pas.
 import numpy as np, pandas as pd, streamlit as st
-import store
-from drift import rapport
-from monitoring import load_config
+import monitoring
 
 st.set_page_config(page_title="Monitoring de la donnée en entrée", layout="wide")
 
@@ -28,7 +28,7 @@ PUCE    = {"drift": "🔴", "surveiller": "🟠", "stable": "🟢"}
 
 @st.cache_data
 def charger_config():
-    cfg = load_config()
+    cfg = monitoring.load_config()
     prof = json.load(open(os.path.join(ROOT, "PROD", "artifacts", "v2",
                                        "reference_profile.json"), encoding="utf-8"))
     return cfg, prof
@@ -36,7 +36,7 @@ def charger_config():
 
 @st.cache_data
 def charger(flux, jours):
-    return store.read_window(flux, jours=jours)
+    return monitoring.fenetre(flux, jours=jours)
 
 
 cfg, prof = charger_config()
@@ -57,7 +57,7 @@ if live.empty:
     st.warning("Base de contrôle vide. Lancer d'abord : `python PROD/simuler_controle.py`")
     st.stop()
 
-rap = rapport(live, prof, seuils)
+rap = monitoring.rapport_drift(prof, seuils, live=live)
 suivies = rap[rap.feature.isin(TOP)]
 # le compteur d'alerte porte sur les 45 variables CALCULÉES, pas sur les 8 affichées :
 # sinon une dérive sur une variable non affichée (p. ex. une chute des prix, que le
@@ -98,25 +98,15 @@ if len(live) < MIN_N:
 # lecture CROISÉE qui porte le signal : le SKU seul peut exploser par simple
 # renumérotation de références sans que le modèle se dégrade, mais SKU + modèle +
 # marque ensemble, c'est l'assortiment du retailer qui a changé.
-GRAINS = [("taux_cat_inconnus",   "taux_cat_inconnus_max",   "catégorie"),
-          ("taux_make_inconnus",  "taux_make_inconnus_max",  "marque"),
-          ("taux_dom_inconnu",    "taux_dom_inconnu_max",    "produit dominant"),
-          ("taux_model_inconnus", "taux_model_inconnus_max", "modèle"),
-          ("taux_sku_inconnus",   "taux_sku_inconnus_max",   "SKU")]
 ETAT = {"dépassé": "🔴", "proche": "🟠", "normal": "🟢"}
 
 if not kpi.empty:
     st.subheader("Couverture du catalogue")
-    lignes, n_depasses = [], 0
-    for col, cle, libelle in GRAINS:
-        val, lim = float(kpi[col].mean()), seuils[cle]
-        etat = "dépassé" if val > lim else ("proche" if val > lim / 2 else "normal")
-        n_depasses += etat == "dépassé"
-        lignes.append({"granularité": libelle, "inconnus": f"{val:.2%}",
-                       "seuil": f"{lim:.2%}", "état": f"{ETAT[etat]} {etat}",
-                       "_ordre": list(ETAT).index(etat)})
-    couv = pd.DataFrame(lignes).sort_values("_ordre").drop(columns="_ordre")
-    st.dataframe(couv, hide_index=True, use_container_width=True)
+    couv, n_depasses = monitoring.couverture_fenetre(seuils, kpi=kpi)
+    aff_couv = couv.assign(inconnus=couv["inconnus"].map("{:.2%}".format),
+                           seuil=couv["seuil"].map("{:.2%}".format),
+                           **{"état": couv["état"].map(lambda e: f"{ETAT[e]} {e}")})
+    st.dataframe(aff_couv, hide_index=True, use_container_width=True)
 
     val_inc = float(kpi["part_valeur_inconnue"].mean())
     detail = f"**{val_inc:.1%}** de la valeur financée porte sur des produits inconnus du modèle."
@@ -132,7 +122,19 @@ if not kpi.empty:
 # ── 3. évolution jour par jour ──────────────────────────────────────────────
 if not kpi.empty:
     st.subheader("Évolution jour par jour")
-    k = kpi.sort_values("date").set_index("date")
+    # plusieurs lots peuvent arriver le même jour (chaque appel à serve écrit une ligne
+    # kpi) : on agrège par jour. Les compteurs se somment, les taux se repondèrent par
+    # le volume du lot. Sans ça, deux lots produiraient deux points à la même date, et
+    # un lot de 50 paniers pèserait autant qu'un lot de 3 000.
+    TAUX = ["taux_sku_inconnus", "taux_make_inconnus", "taux_dom_inconnu"]
+    g = kpi.copy()
+    for c in TAUX:
+        g[c] = g[c] * g["n_recus"]
+    k = g.groupby("date")[["n_recus", "n_conformes"] + TAUX].sum().sort_index()
+    k["taux_conformite"] = k["n_conformes"] / k["n_recus"]
+    for c in TAUX:
+        k[c] = k[c] / k["n_recus"]
+
     g1, g2 = st.columns(2)
     with g1:
         st.caption("Taux de conformité")
@@ -173,10 +175,10 @@ choix = st.selectbox("Variable", options, index=0,
                      format_func=lambda f: f + ("  ·  suivie" if f in TOP else ""))
 
 par_jour = []
-for d in sorted(store.read_window("flux_a", jours=7)["ts"].str[:10].unique()):
-    w = store.read_window("flux_a", depuis=d)
+for d in sorted(monitoring.fenetre("flux_a", jours=7)["ts"].str[:10].unique()):
+    w = monitoring.fenetre("flux_a", depuis=d)
     w = w[w["ts"].str[:10] == d]
-    r = rapport(w, prof, seuils)
+    r = monitoring.rapport_drift(prof, seuils, live=w)
     ligne = r[r.feature == choix]
     if not ligne.empty:
         par_jour.append({"date": d, "valeur": float(ligne["valeur"].iloc[0]),

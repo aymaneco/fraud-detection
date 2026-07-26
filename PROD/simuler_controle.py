@@ -13,23 +13,22 @@ surtout visible quelle que soit la fenêtre choisie :
 
 Plus quelques paniers non conformes chaque jour -> taux de conformité.
 
-Chaque panier passe par le VRAI pipeline (portail -> features figées -> score) puis
-par le VRAI échantillonnage (20 % au hash) : la base produite est de même nature que
-celle qu'alimenterait la production.
+Ce script ne fait QUE fabriquer du trafic. Chaque lot est ensuite confié à
+`inference.serve`, exactement comme le ferait la production : c'est `serve` qui
+valide, score, échantillonne et remplit la base de contrôle. Rien du pipeline n'est
+réimplémenté ici, sinon la démonstration ne prouverait rien.
 
 Usage :  python PROD/simuler_controle.py
 """
-import os, sys, json, shutil
+import os, sys, shutil
 from datetime import datetime, timezone, timedelta
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT); sys.path.insert(0, os.path.join(ROOT, "PROD", "pipeline"))
 
 import numpy as np, pandas as pd
-from monitoring import check_schema, conformity_report, route, load_config, coverage
-from features_static import build_static, STATIC_COLS
-from product_feats import load_baskets, apply_tables
-from inference import load_artifacts
+from monitoring import load_config
+from inference import load_artifacts, serve
 import store
 
 N_JOURS   = 7
@@ -109,7 +108,6 @@ def derive(lot, jour_idx, rng):
 def main():
     cfg = load_config()
     art = load_artifacts("v2")
-    FEAT = art["config"]["features"]
 
     base_dir = os.path.join(ROOT, "control_base")
     if os.path.isdir(base_dir):
@@ -125,40 +123,8 @@ def main():
         src["ID"] = src["ID"] + j * 1_000_000    # IDs distincts d'un jour à l'autre
         lot  = casser(derive(src, j, rng))
 
-        # 1) portail
-        sc = check_schema(lot)
-        ok = lot[sc["conforme"].to_numpy()].reset_index(drop=True)
-
-        # 2) features figées + score (le vrai pipeline)
-        S  = build_static(ok)
-        B  = load_baskets(ok)
-        pf = apply_tables(art["tables"], art["base"], S["ID"].tolist(), B).reset_index(drop=True)
-        X  = pd.concat([S[STATIC_COLS], pf], axis=1)[FEAT]
-        proba = art["model"].predict_proba(art["encoder"].transform(X))[:, 1]
-
-        # 3) couverture du jour (indicateur de fraîcheur du catalogue)
-        cov, _ = coverage(ok, art["tables"], B)
-
-        # 4) routage sur le LOT COMPLET, conformes et rejets : c'est `route` qui décide
-        # des deux flux, pas la simulation. Les non conformes n'ont pas de score.
-        proba_par_id = dict(zip(S["ID"].to_numpy(), proba))
-        r = route(lot["ID"], sc["conforme"], lot["ID"].map(proba_par_id), cfg)
-
-        log = X.copy()
-        log.insert(0, "ID", S["ID"].to_numpy())
-        log["score"] = proba
-        log = log[log["ID"].isin(r.loc[r.flux_a, "ID"])]
-        store.append(log, "flux_a", ts=jour)
-
-        err = pd.DataFrame({"ID": lot["ID"].to_numpy(), "raisons": sc["raisons"].to_numpy(),
-                            "raison_b": r["raison_b"].to_numpy()})[r["flux_b"].to_numpy()]
-        store.append(err, "erreurs", ts=jour)
-
-        # 5) KPI du jour, archivés à côté (le job batch les recalculerait)
-        rep = conformity_report(lot, sc)          # sc déjà calculé : pas de 2e validation
-        kpi = {"date": jour.strftime("%Y-%m-%d"), "n_recus": rep["n"],
-               "n_conformes": rep["conformes"], "taux_conformite": rep["taux_conformite"], **cov}
-        store.append(pd.DataFrame([kpi]), "kpi", ts=jour)
+        # tout le pipeline (portail, score, échantillonnage, écriture) est dans serve
+        _, kpi = serve(lot, art, cfg, ts=jour)
         resume.append(kpi)
 
     print(f"base de contrôle simulée : {N_JOURS} jours\n")

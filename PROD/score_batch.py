@@ -1,9 +1,11 @@
 """Scoring par lot : un CSV de paniers -> un CSV de probabilités (format soumission).
 
-Même enchaînement qu'en temps réel : PORTAIL (contrat Pydantic) puis modèle. Un panier
-non conforme est journalisé dans `control_base/erreurs/` avec sa raison et ne passe PAS
-au modèle. Il reçoit malgré tout une ligne en sortie, à 0, pour que le fichier produit
-couvre exactement les ID reçus.
+Point d'entrée mince : il ne fait que lire un fichier, appeler `inference.serve` et
+écrire le résultat. Tout le reste (portail, score, échantillonnage, journalisation
+dans la base de contrôle) appartient à `serve` et vaut donc pour n'importe quel canal.
+
+Un panier non conforme n'est pas scoré. Il reçoit malgré tout une ligne en sortie,
+à 0, pour que le fichier produit couvre exactement les ID reçus.
 
 Usage :  python PROD/score_batch.py <input.csv> <output.csv> [version=v2]
 """
@@ -13,41 +15,28 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT); sys.path.insert(0, os.path.join(ROOT, "PROD", "pipeline"))
 
 import pandas as pd
-from inference import load_artifacts, predict
-from monitoring import check_schema, conformity_report
-import store
+from inference import load_artifacts, serve
 
 
 def main(inp, outp, version="v2"):
     art = load_artifacts(version)
     raw = pd.read_csv(inp, low_memory=False)
 
-    # 1) portail : on valide AVANT de scorer, et on journalise les rejets
-    sc  = check_schema(raw)
-    rep = conformity_report(raw, sc)
-    conf = sc["conforme"].to_numpy()
-    if rep["non_conformes"]:
-        # même schéma que le flux B temps réel (ID, raisons, raison_b) : la partition
-        # erreurs/ se lit comme une seule table quelle que soit sa provenance.
-        store.append(pd.DataFrame({"ID": raw.loc[~conf, "ID"].to_numpy(),
-                                   "raisons": sc.loc[~conf, "raisons"].to_numpy(),
-                                   "raison_b": "non_conforme"}), "erreurs")
+    out, kpi = serve(raw, art)
 
-    # 2) modèle, sur les seuls paniers conformes
-    res = predict(raw[conf].reset_index(drop=True), art)
-
-    # 3) sortie sur TOUS les ID reçus : rejeté ou synthétique -> 0
     sub = pd.DataFrame({"ID": raw["ID"].to_numpy()})
-    sub["fraud_flag"] = sub["ID"].map(dict(zip(res.ID, res.fraud_proba))).fillna(0.0)
+    sub["fraud_flag"] = sub["ID"].map(dict(zip(out.ID, out.fraud_proba))).fillna(0.0)
     sub.to_csv(outp)                              # colonne d'index -> format soumission
 
-    n_synth = int((raw.get("is_synthetic", pd.Series([], dtype=int)) == 1).sum())
-    print(f"conformité : {rep['taux_conformite']:.2%} ({rep['non_conformes']:,} rejeté(s))"
-          + (f" -> {rep['raisons']}" if rep["raisons"] else ""))
-    print(f"scoré {len(res):,} paniers sur {len(sub):,} reçus "
+    n_rejetes = kpi["n_recus"] - kpi["n_conformes"]
+    n_synth   = int((raw.get("is_synthetic", pd.Series([], dtype=int)) == 1).sum())
+    print(f"conformité : {kpi['taux_conformite']:.2%} ({n_rejetes:,} rejeté(s))")
+    print(f"scoré {kpi['n_conformes']:,} paniers sur {kpi['n_recus']:,} reçus "
           f"(dont {n_synth} synthétiques à 0) -> {outp}")
-    print(f"proba : min {res.fraud_proba.min():.4f} | médiane {res.fraud_proba.median():.4f} "
-          f"| max {res.fraud_proba.max():.4f}")
+    print(f"catalogue : SKU inconnus {kpi['taux_sku_inconnus']:.2%} | "
+          f"marques {kpi['taux_make_inconnus']:.2%} | dominant {kpi['taux_dom_inconnu']:.2%}")
+    print(f"proba : min {out.fraud_proba.min():.4f} | médiane {out.fraud_proba.median():.4f} "
+          f"| max {out.fraud_proba.max():.4f}")
 
 
 if __name__ == "__main__":
