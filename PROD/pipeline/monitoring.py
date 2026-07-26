@@ -113,6 +113,20 @@ def fenetre(flux, jours=None, depuis=None):
     return store.read_window(flux, jours=jours, depuis=depuis)
 
 
+def taux_fenetre(kpi, col, poids="n_paniers"):
+    """Moyenne d'un taux sur la fenêtre, PONDÉRÉE par le volume de chaque lot.
+
+    `kpi` a une ligne par lot traité, pas par jour. Une moyenne simple donnerait le
+    même poids à un lot de 50 paniers et à un lot de 3 000. Chaque ligne porte son
+    propre dénominateur : `n_recus` pour la conformité, `n_paniers` pour les taux de
+    couverture (les rejets n'ont pas de produits à confronter aux tables).
+    """
+    if kpi.empty:
+        return 0.0
+    p = kpi[poids].to_numpy(float)
+    return float((kpi[col].to_numpy(float) * p).sum() / p.sum()) if p.sum() else 0.0
+
+
 def rapport_drift(profile, seuils, jours=7, live=None):
     """Drift de la fenêtre contre le profil de référence figé.
 
@@ -142,7 +156,7 @@ def couverture_fenetre(seuils, jours=7, kpi=None):
         return pd.DataFrame(), 0
     lignes, n_depasses = [], 0
     for col, cle, libelle in GRAINS:
-        val, lim = float(kpi[col].mean()), seuils[cle]
+        val, lim = taux_fenetre(kpi, col), seuils[cle]
         etat = "dépassé" if val > lim else ("proche" if val > lim / 2 else "normal")
         n_depasses += etat == "dépassé"
         lignes.append({"granularité": libelle, "inconnus": val, "seuil": lim, "état": etat})

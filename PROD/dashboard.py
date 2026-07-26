@@ -77,7 +77,7 @@ if not kpi.empty:
     conf = kpi["n_conformes"].sum() / kpi["n_recus"].sum()
     c2.metric("Conformité", f"{conf:.2%}",
               delta=f"{(conf - seuils['taux_conformite_min'])*100:+.2f} pts vs seuil")
-    dom = kpi["taux_dom_inconnu"].mean()
+    dom = monitoring.taux_fenetre(kpi, "taux_dom_inconnu")
     c3.metric("Produit dominant inconnu", f"{dom:.2%}",
               delta=f"{(dom - seuils['taux_dom_inconnu_max'])*100:+.2f} pts vs seuil",
               delta_color="inverse")
@@ -108,7 +108,10 @@ if not kpi.empty:
                            **{"état": couv["état"].map(lambda e: f"{ETAT[e]} {e}")})
     st.dataframe(aff_couv, hide_index=True, use_container_width=True)
 
-    val_inc = float(kpi["part_valeur_inconnue"].mean())
+    # pondéré par le nombre de paniers. Le poids exact serait la valeur totale du lot,
+    # qui n'est pas archivée : c'est donc une approximation, suffisante pour un ordre
+    # de grandeur affiché à côté d'une alerte.
+    val_inc = monitoring.taux_fenetre(kpi, "part_valeur_inconnue")
     detail = f"**{val_inc:.1%}** de la valeur financée porte sur des produits inconnus du modèle."
     if n_depasses >= 3:
         st.error(f"**{n_depasses} granularités sur 5 au-dessus du seuil.** Ce n'est pas une "
@@ -126,14 +129,16 @@ if not kpi.empty:
     # kpi) : on agrège par jour. Les compteurs se somment, les taux se repondèrent par
     # le volume du lot. Sans ça, deux lots produiraient deux points à la même date, et
     # un lot de 50 paniers pèserait autant qu'un lot de 3 000.
+    # la conformité se pondère par n_recus, les taux de couverture par n_paniers :
+    # les rejets n'ont pas de produits à confronter aux tables.
     TAUX = ["taux_sku_inconnus", "taux_make_inconnus", "taux_dom_inconnu"]
     g = kpi.copy()
     for c in TAUX:
-        g[c] = g[c] * g["n_recus"]
-    k = g.groupby("date")[["n_recus", "n_conformes"] + TAUX].sum().sort_index()
+        g[c] = g[c] * g["n_paniers"]
+    k = g.groupby("date")[["n_recus", "n_conformes", "n_paniers"] + TAUX].sum().sort_index()
     k["taux_conformite"] = k["n_conformes"] / k["n_recus"]
     for c in TAUX:
-        k[c] = k[c] / k["n_recus"]
+        k[c] = k[c] / k["n_paniers"]
 
     g1, g2 = st.columns(2)
     with g1:

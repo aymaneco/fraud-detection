@@ -271,7 +271,7 @@ n'existe qu'une seule implémentation des 7 facettes.
 |---|---|---|---|---|
 | **Taux de conformité** | une intégration amont qui casse | 100 % des paniers reçus | à l'inférence | 98 % |
 | **Raisons de rejet** | quelle règle est violée (`prix_negatif`, `panier_vide`…) | 100 % des rejets | à l'inférence | diagnostic |
-| **Produits inconnus**, 5 granularités | le catalogue produit a changé | 100 % des paniers reçus | à l'inférence | 0,5 % à 15 % |
+| **Produits inconnus**, 5 granularités | le catalogue produit a changé | 100 % des paniers **conformes** | à l'inférence | 0,5 % à 15 % |
 | **PSI**, 9 variables | la *forme* d'une distribution a bougé | échantillon 20 % | en différé | 0,10 et 0,25 |
 | **Écart de moyenne**, 36 variables | le *niveau* d'une variable a bougé | échantillon 20 % | en différé | 50 % relatif, plancher 1 point |
 
@@ -337,6 +337,55 @@ Le hachage md5 est préféré au `hash()` natif de Python, qui est **randomisé 
 processus** : avec lui, deux serveurs ne sélectionneraient pas le même échantillon et le
 tirage ne serait pas rejouable.
 
+### Mesurer sur 100 % sans stocker 100 %
+
+Point important pour lever une ambiguïté : la partition `kpi` ne contient **pas** les
+lignes des paniers. Elle contient **une ligne par lot traité**, faite de compteurs
+agrégés. Voici une ligne réelle :
+
+```
+date                     2026-07-26
+n_recus                  3003          <- tout le lot reçu
+n_conformes              3001
+taux_conformite          0.99933
+n_paniers                3001          <- conformes, hors synthétiques
+taux_sku_inconnus        0.36902
+taux_model_inconnus      0.36164
+taux_cat_inconnus        0.0
+taux_make_inconnus       0.15342
+taux_dom_inconnu         0.35755
+part_valeur_inconnue     0.36898
+```
+
+Douze valeurs pour résumer 3 003 paniers. C'est ce qui permet de mesurer sur l'intégralité
+du trafic tout en n'archivant qu'un échantillon : on calcule pendant que la donnée passe,
+et on ne garde que le résultat.
+
+**Chaque ligne porte son propre dénominateur**, et c'est indispensable pour recombiner les
+lots ensuite. Agréger une fenêtre ne se fait donc jamais en moyennant les taux, mais en
+**sommant les compteurs** :
+
+```python
+conformite = kpi["n_conformes"].sum() / kpi["n_recus"].sum()
+taux_dom   = (kpi["taux_dom_inconnu"] * kpi["n_paniers"]).sum() / kpi["n_paniers"].sum()
+```
+
+Le dénominateur diffère selon la métrique : `n_recus` pour la conformité, `n_paniers` pour
+les taux de couverture, puisqu'un panier rejeté n'a pas de produits à confronter aux
+tables.
+
+La différence n'est pas théorique. Sur une fenêtre de 7 lots de 3 001 paniers, ajoutons un
+petit lot de 40 paniers dont tous les produits sont inconnus :
+
+| Méthode | Poids du petit lot | Taux de produit dominant inconnu |
+|---|---|---|
+| moyenne des taux | 1/8, soit 12,5 % | **26,18 %** |
+| somme des compteurs | 40/21 061, soit 0,19 % | **15,79 %** |
+
+**10,4 points d'écart** pour un lot qui pèse deux millièmes du trafic. La moyenne simple
+aurait signalé une forte dégradation là où il ne s'est presque rien passé. C'est le rôle
+de `monitoring.taux_fenetre`, qui applique systématiquement la pondération.
+
 Deux flux indépendants, jamais mélangés :
 
 | Flux | Contenu | Usage |
@@ -387,7 +436,7 @@ D'où la règle qui structure `monitoring.py` :
 | Métrique | Ce qu'elle exige | Quand la calculer | Où |
 |---|---|---|---|
 | Conformité | tous les paniers reçus | **au passage** | `serve` -> partition `kpi` |
-| Couverture | les produits bruts, tous les paniers | **au passage** | `serve` -> partition `kpi` |
+| Couverture | les produits bruts de tous les paniers conformes | **au passage** | `serve` -> partition `kpi` |
 | PSI / drift | les 45 variables de l'échantillon | **en différé** | `monitoring` <- `flux_a` |
 
 La partition `kpi` n'a pas d'autre raison d'être : elle conserve un résultat qu'on ne
