@@ -79,18 +79,6 @@ data/                       brut, nettoyé, features dérivées
 control_base/               base de contrôle (Parquet partitionné par jour)
 ```
 
-**Règle d'architecture** : `pipeline/` ne remonte jamais vers la racine de `PROD/`.
-Les modules sont des briques, les scripts sont les seuls à les assembler.
-
-```
-couche 3   train.py   score_batch.py   simuler_controle.py   dashboard.py
-couche 2                    inference.py
-couche 1   features_static   product_feats   monitoring   drift   store
-couche 0                        contract.py
-```
-
-Chaque couche n'appelle que celles du dessous.
-
 ---
 
 ## 3. La démarche (DEV)
@@ -310,8 +298,23 @@ scoré 7 paniers sur 10 reçus
 
 ### Niveau 1 bis : l'échantillonnage
 
-Conserver tout le trafic serait coûteux et inutile. On garde **20 %** des paniers
-conformes, tirés par `md5(ID) % 100 < 20`.
+Conserver le **détail** de tout le trafic serait coûteux et inutile. On n'en garde que
+20 %, tirés par `md5(ID) % 100 < 20`.
+
+Attention à ne pas confondre : l'échantillonnage porte sur le **stockage du détail**, pas
+sur la **mesure**. On ne renonce jamais à compter. Trois niveaux de conservation
+coexistent :
+
+| Ce qui est conservé | Volume | Partition |
+|---|---|---|
+| détail des paniers conformes (45 variables + score) | **20 %** | `flux_a` |
+| détail des paniers rejetés (ID + raison) | **100 %** | `erreurs` |
+| compteurs agrégés (reçus, conformes, couverture) | **100 %** | `kpi` |
+
+C'est la troisième ligne qui permet de calculer la conformité sur l'intégralité du
+trafic : `n_recus` et `n_conformes` portent sur les 3 003 paniers du lot, pas sur les
+619 échantillonnés. Seul le PSI se contente de l'échantillon, parce qu'une distribution
+s'estime très bien sur 20 % d'un tirage uniforme.
 
 Le hachage md5 est préféré au `hash()` natif de Python, qui est **randomisé à chaque
 processus** : avec lui, deux serveurs ne sélectionneraient pas le même échantillon et le
@@ -444,8 +447,7 @@ donc spécifiquement à partir de 3 granularités sur 5.
 
 ### La base de contrôle
 
-Stockage **Parquet partitionné par jour**, ce qu'on ferait en production sur S3 ou HDFS
-avec Spark ou DuckDB : le job différé ne charge que les partitions de sa fenêtre.
+Stockage **Parquet partitionné par jour**
 
 ```
 control_base/
@@ -545,23 +547,55 @@ prouverait rien.
 
 ## 7. Limites assumées
 
-**Le service attend de la donnée déjà nettoyée.** Le portail valide la *structure*
-(types, prix positif, au moins un vrai bien) mais n'applique pas les normalisations de
-`DATA_QUALITY` (harmonisation `item` et `make`). Un CSV brut passerait le portail tout en
-faisant échouer les lookups produit. Le format attendu en entrée est celui de
-`data/X_*_clean.csv`.
+Ce dépôt est une **version de démonstration**. Le monitoring qu'il contient sert à
+montrer à quoi ressemble concrètement la surveillance d'une donnée d'entrée : quels
+indicateurs, calculés à quel moment, sur quel périmètre, et pourquoi. Il tourne
+réellement, sur une base de contrôle réelle, mais il n'a pas la robustesse d'un système
+exploité. Les quatre points ci-dessous sont les écarts connus, avec ce qu'il faudrait
+faire pour les combler.
 
-**La distribution des scores n'est pas surveillée.** Une référence de score calculée sur
-les données d'entraînement serait biaisée (0,0528 en échantillon contre 0,0410 hors
-échantillon) et déclencherait de fausses alertes en permanence. Le sujet ici est la
-donnée d'entrée.
+### Le nettoyage sémantique n'est pas dans le service
 
-**Le job différé n'est pas planifié.** `monitoring.rapport_drift` est appelé par le
-dashboard au moment de l'affichage. En production on l'exécuterait la nuit, on archiverait
-le résultat et le dashboard se contenterait de le lire.
+Le portail (`PROD/pipeline/contract.py`, fonction `validate_wide`) valide la *structure* :
+types, prix positif, au moins un vrai bien. Il n'applique **pas** les normalisations de
+nomenclature de `DATA_QUALITY`, à savoir `norm_item` (173 libellés vers 139) et
+`norm_make` (829 vers 808). Ces deux fonctions n'existent aujourd'hui **que dans
+`DEV/DATA_QUALITY.ipynb`**, dans aucun module de `PROD/`.
 
-**Pas d'endpoint HTTP.** Sa logique existe entièrement dans `inference.serve` ; un
-`@app.post("/score")` FastAPI ne serait que du transport.
+Conséquence concrète : un CSV brut passerait le portail sans erreur, mais les lookups
+produit échoueraient en masse, les tables ayant été construites sur les libellés
+normalisés. Le format attendu en entrée est donc celui de `data/X_*_clean.csv`.
+
+**Il faut l'intégrer.** `norm_item` et `norm_make` doivent sortir du notebook pour
+rejoindre un module `PROD/pipeline/normalisation.py`, appelé au tout début de `serve`,
+avant le portail. Le notebook l'importerait au lieu de définir les fonctions. C'est
+exactement le traitement qui a déjà été appliqué au calcul des variables, extrait dans
+`features_static.py` et partagé entre dev et prod : deux traitements de la donnée, un
+seul a franchi la frontière pour l'instant.
+
+### La distribution des scores n'est pas surveillée
+
+Choix délibéré, pas un oubli. Une référence de score calculée sur les données
+d'entraînement serait biaisée (0,0528 en échantillon contre 0,0410 hors échantillon) et
+déclencherait de fausses alertes en permanence. Surveiller la sortie du modèle demande
+une référence hors échantillon, donc un second jeu figé à l'entraînement. Le sujet du
+test étant la donnée d'entrée, cette partie n'a pas été traitée.
+
+### Le job différé n'est pas planifié
+
+`monitoring.rapport_drift` est appelé par le dashboard **au moment de l'affichage**. Pour
+une démonstration c'est suffisant et même pratique, puisque changer la fenêtre recalcule
+tout. En production on l'exécuterait la nuit par un ordonnanceur (Airflow, Control-M,
+cron), on archiverait le résultat dans une partition `drift/`, on émettrait les alertes
+depuis ce job, et le dashboard se contenterait de lire. La rétention de 90 jours
+(`store.purge()`) serait déclenchée par le même ordonnanceur.
+
+### Pas d'endpoint HTTP
+
+Sa logique existe entièrement dans `inference.serve`, qui enchaîne déjà portail, score,
+échantillonnage et journalisation. Un `@app.post("/score")` FastAPI ne serait que du
+transport, plus la gestion des codes de retour (422 sur panier invalide). Ce qui manque
+est la couche réseau, pas la logique métier.
 
 ---
 
