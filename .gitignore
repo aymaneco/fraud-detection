@@ -1,5 +1,3 @@
-# Caches et sorties régénérées — pas du code, pas des données.
-# iframe_figures pèse à lui seul ~560 Mo (rendus Plotly recréés à chaque exécution).
 iframe_figures/
 __pycache__/
 *.py[cod]
