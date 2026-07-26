@@ -1,0 +1,17 @@
+# Caches et sorties régénérées — pas du code, pas des données.
+# iframe_figures pèse à lui seul ~560 Mo (rendus Plotly recréés à chaque exécution).
+iframe_figures/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# environnements / éditeurs
+.venv/
+.env
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# réglages locaux de l'outillage (chemins personnels)
+.claude/settings.local.json

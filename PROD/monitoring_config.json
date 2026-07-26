@@ -1,0 +1,44 @@
+{
+  "_doc": "Configuration du monitoring. Modifiable sans toucher au code.",
+
+  "flux_a": {
+    "_doc": "Échantillon de contrôle UNIFORME (hash sur ID). Double usage : PSI/drift, et base d'étiquetage NON BIAISÉE (précision ET rappel). Ne jamais biaiser.",
+    "sample_rate_pct": 20
+  },
+
+  "flux_b": {
+    "_doc": "Log d'erreurs : paniers rejetés par le portail (jamais scorés). score_threshold=null : inutile de garder les scores élevés, leurs étiquettes viennent du SI métier et le pipeline déterministe permet de les REJOUER depuis les artefacts figés.",
+    "non_conformes": true,
+    "score_threshold": null
+  },
+
+  "fenetre": {
+    "_doc": "Contraintes du job batch de niveau 2. La rétention est appliquée par store.purge(), qu'un ordonnanceur appellerait en production : la démo ne la déclenche pas (7 jours simulés, très en deçà des 90).",
+    "min_lignes_psi": 2000,
+    "retention_jours": 90
+  },
+
+  "features_affichees": {
+    "_doc": "Top 8 SHAP du modèle v2 (notebook FEATURE_SELECTION) : les variables dont le PSI est affiché dans le dashboard. Les 45 restent CALCULÉES pour le drill-down. À régénérer à chaque réentraînement.",
+    "top": ["sku_fraude_mean", "sku_fraude_max", "dom_make", "model_fraude_mean",
+            "dom_cat", "dom_model_fraude", "cat_fraude_mean", "make_fraude_mean"]
+  },
+
+  "seuils_alerte": {
+    "_doc": "Seuils calibrés sur des mesures réelles, pas devinés (voir valeurs observées).",
+
+    "taux_conformite_min": 0.98,
+    "_obs_conformite": "100% mesuré sur 23 198 paniers propres -> 98% laisse une marge saine",
+
+    "psi_surveiller": 0.1,
+    "psi_alerte": 0.25,
+    "_obs_psi": "conventions du crédit scoring : <0,1 stable | 0,1-0,25 surveiller | >0,25 drift",
+
+    "taux_cat_inconnus_max": 0.005,
+    "taux_make_inconnus_max": 0.02,
+    "taux_dom_inconnu_max": 0.03,
+    "taux_model_inconnus_max": 0.10,
+    "taux_sku_inconnus_max": 0.15,
+    "_obs_couverture": "Niveaux NATURELS mesurés sur données neuves (test) : catégorie 0,003% | marque 0,21% | dominant 0,78% | modèle 4,51% | SKU 6,73%. Plus la cardinalité est basse, plus un inconnu est parlant -> seuils d'autant plus serrés. Les meilleures sentinelles sont CATEGORIE (nouvel univers produit) et MARQUE (nouvel assortiment) : marge x10 à x150. Le SKU seul peut exploser sans dégrader le modèle (simple renumérotation, vérifié en simulation) -> contexte uniquement, pas d'alerte."
+  }
+}
