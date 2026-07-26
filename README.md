@@ -548,6 +548,46 @@ l'eau sur un lot reçu (`conformity_report`, `coverage`) ou en différé sur la 
 (`fenetre`, `rapport_drift`, `couverture_fenetre`). `dashboard.py` n'importe ni `store`
 ni `drift` : il passe uniquement par `monitoring`.
 
+### La donnée du dashboard est SIMULÉE
+
+Point à ne pas manquer : il n'y a pas de trafic réel. Ce dépôt ne reçoit pas de demandes
+de financement. Pour que le dashboard ait quelque chose à montrer,
+`PROD/simuler_controle.py` fabrique **7 jours de trafic**, et c'est cette base
+de démonstration qu'on visualise.
+
+**Ce qui est réel** : les paniers eux-mêmes. Ils sont tirés du jeu de **test** du
+challenge (`data/X_test_clean.csv`), que le modèle n'a jamais vu à l'entraînement.
+3 000 paniers par jour, tirés sans remise avec une graine différente chaque jour, et des
+identifiants décalés de 1 000 000 par jour pour qu'ils ne se recouvrent pas.
+
+**Ce qui est injecté** : la dégradation. Une dérive **cumulative**, chaque jour conservant
+les couches des précédents, pour que les fenêtres 1, 3 et 7 jours montrent toutes quelque
+chose. Un pic isolé disparaîtrait dans une fenêtre large.
+
+| Jour | Ce qui est injecté ce jour-là | Ce que le monitoring doit voir |
+|---|---|---|
+| J-6, J-5 | rien | tout vert, sert de référence |
+| J-4 | prix multipliés par **0,75** | le PSI des variables de montant commence à monter |
+| J-3 | prix multipliés par **0,55** | le PSI franchit le seuil de 0,25 |
+| J-2 | **35 %** des codes produit, modèles et marques préfixés `NEW_`, `NOUVEAU_`, `MARQUE_X_` | couverture du catalogue et PSI des taux produit |
+| J-1 | **55 %** des marques forcées à `SAMSUNG`, toutes les lignes `WARRANTY` retirées | PSI de `dom_make`, chute de `has_warranty` |
+| J0 | ligne `FULFILMENT CHARGE` ajoutée dans le 2e emplacement quand il est vide, premier bien recopié sur 2 emplacements libres | variables de logistique et de structure |
+
+**Les rejets aussi sont fabriqués** : 3 paniers supplémentaires sont ajoutés chaque jour,
+dont un à **prix négatif** et un **sans aucun article**. D'où les 3 003 paniers reçus par
+jour au lieu de 3 000, et le taux de conformité de 99,933 % constant. Sans eux le portail
+n'aurait jamais rien à rejeter et la métrique de conformité resterait plate à 100 %.
+
+**Ce qui n'est pas simulé** : le pipeline. `simuler_controle.py` fabrique des paniers et
+les confie à `inference.serve`, exactement comme le ferait la production. Portail, score,
+échantillonnage, écriture des trois partitions : tout passe par le vrai code. Sinon la
+démonstration ne prouverait rien.
+
+Une limite honnête : la dérive est **artificielle et brutale**. Un vrai catalogue ne
+bascule pas 55 % de ses marques en une nuit. Ces amplitudes sont choisies pour que les
+indicateurs réagissent visiblement sur sept jours, pas pour représenter un incident
+réaliste.
+
 ### Le dashboard
 
 `streamlit run PROD/dashboard.py`, cinq blocs sur une seule page :
@@ -606,10 +646,9 @@ python PROD/simuler_controle.py
 streamlit run PROD/dashboard.py
 ```
 
-La simulation fabrique 7 jours de trafic avec une dérive **cumulative** : baisse des prix
-à partir de J-4, produits inconnus à J-2, bascule du mix marques et disparition des
-garanties à J-1, livraison systématique à J0. Cumulative et non ponctuelle, pour que les
-fenêtres 1, 3 et 7 jours montrent toutes quelque chose.
+L'étape 4 est indispensable avant l'étape 5 : **le dashboard n'a de données que
+simulées**. Le détail de ce qui est fabriqué et de ce qui est réel est en
+[section 5](#la-donnée-du-dashboard-est-simulée).
 
 Elle ne réimplémente **rien** du pipeline : elle fabrique des paniers et les confie à
 `inference.serve`, exactement comme le ferait la production. Sinon la démonstration ne
