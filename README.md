@@ -590,6 +590,11 @@ réaliste.
 
 ### Le dashboard
 
+[![Le dashboard de monitoring](DEV/images/dashboard_monitoring.png)](demo_dashboard.webm)
+
+*Cliquer l'image pour la [démonstration vidéo](demo_dashboard.webm) : changement de
+fenêtre, infobulles de définition, inspection d'une variable jour par jour.*
+
 `streamlit run PROD/dashboard.py`, cinq blocs sur une seule page :
 
 1. **Indicateurs du jour** : volume reçu, taux d'échantillonnage, conformité, nombre de
